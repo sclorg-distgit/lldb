@@ -1,0 +1,169 @@
+From 4fe12b61ab7102571f2a7ab662a79d4e1d6788de Mon Sep 17 00:00:00 2001
+From: Jan Kratochvil <jan.kratochvil@redhat.com>
+Date: Mon, 31 Jul 2017 17:02:52 +0000
+Subject: [PATCH] Fix LLDB crash accessing unknown DW_FORM_* attributes
+
+Current LLDB (that is without DWZ support) crashes accessing Fedora debug info:
+READ of size 8 at 0x60200000ffc8 thread T0
+    #0 in DWARFDebugInfoEntry::BuildAddressRangeTable(SymbolFileDWARF*, DWARFCompileUnit const*, DWARFDebugAranges*) const tools/lldb/source/Plugins/SymbolFile/DWARF/DWARFDebugInfoEntry.cpp:1336
+
+Greg Clayton: We will need a warning to be emitted in
+SymbolFileDWARF::CalculateAbilities() stating we won't parse the DWARF due to
+"unsupported DW_FORM value of 0x1f20".
+
+Patch has been mostly written by Greg Clayton.
+
+Differential revision: https://reviews.llvm.org/D35622
+
+git-svn-id: https://llvm.org/svn/llvm-project/lldb/trunk@309581 91177308-0d34-0410-b5e6-96231b3b80d8
+---
+ .../Plugins/SymbolFile/DWARF/DWARFDebugAbbrev.cpp  | 24 +++++++++++++++
+ source/Plugins/SymbolFile/DWARF/DWARFDebugAbbrev.h |  2 ++
+ source/Plugins/SymbolFile/DWARF/DWARFFormValue.cpp | 36 ++++++++++++++++++++++
+ source/Plugins/SymbolFile/DWARF/DWARFFormValue.h   |  1 +
+ .../Plugins/SymbolFile/DWARF/SymbolFileDWARF.cpp   | 14 +++++++++
+ 5 files changed, 77 insertions(+)
+
+diff --git a/source/Plugins/SymbolFile/DWARF/DWARFDebugAbbrev.cpp b/source/Plugins/SymbolFile/DWARF/DWARFDebugAbbrev.cpp
+index fe6df91..fa2dce6 100644
+--- a/source/Plugins/SymbolFile/DWARF/DWARFDebugAbbrev.cpp
++++ b/source/Plugins/SymbolFile/DWARF/DWARFDebugAbbrev.cpp
+@@ -98,6 +98,21 @@ dw_uleb128_t DWARFAbbreviationDeclarationSet::AppendAbbrevDeclSequential(
+ }
+ 
+ //----------------------------------------------------------------------
++// DWARFAbbreviationDeclarationSet::GetUnsupportedForms()
++//----------------------------------------------------------------------
++void DWARFAbbreviationDeclarationSet::GetUnsupportedForms(
++    std::set<dw_form_t> &invalid_forms) const {
++  for (const auto &abbr_decl : m_decls) {
++    const size_t num_attrs = abbr_decl.NumAttributes();
++    for (size_t i=0; i<num_attrs; ++i) {
++      dw_form_t form = abbr_decl.GetFormByIndex(i);
++      if (!DWARFFormValue::FormIsSupported(form))
++        invalid_forms.insert(form);
++    }
++  }
++}
++
++//----------------------------------------------------------------------
+ // Encode
+ //
+ // Encode the abbreviation table onto the end of the buffer provided
+@@ -175,3 +190,12 @@ DWARFDebugAbbrev::GetAbbreviationDeclarationSet(
+     return &(pos->second);
+   return NULL;
+ }
++
++//----------------------------------------------------------------------
++// DWARFDebugAbbrev::GetUnsupportedForms()
++//----------------------------------------------------------------------
++void DWARFDebugAbbrev::GetUnsupportedForms(
++    std::set<dw_form_t> &invalid_forms) const {
++  for (const auto &pair : m_abbrevCollMap)
++    pair.second.GetUnsupportedForms(invalid_forms);
++}
+diff --git a/source/Plugins/SymbolFile/DWARF/DWARFDebugAbbrev.h b/source/Plugins/SymbolFile/DWARF/DWARFDebugAbbrev.h
+index 137c817..2bacb63 100644
+--- a/source/Plugins/SymbolFile/DWARF/DWARFDebugAbbrev.h
++++ b/source/Plugins/SymbolFile/DWARF/DWARFDebugAbbrev.h
+@@ -41,6 +41,7 @@ public:
+   // void Encode(BinaryStreamBuf& debug_abbrev_buf) const;
+   dw_uleb128_t
+   AppendAbbrevDeclSequential(const DWARFAbbreviationDeclaration &abbrevDecl);
++  void GetUnsupportedForms(std::set<dw_form_t> &invalid_forms) const;
+ 
+   const DWARFAbbreviationDeclaration *
+   GetAbbreviationDeclaration(dw_uleb128_t abbrCode) const;
+@@ -65,6 +66,7 @@ public:
+   GetAbbreviationDeclarationSet(dw_offset_t cu_abbr_offset) const;
+   void Dump(lldb_private::Stream *s) const;
+   void Parse(const lldb_private::DWARFDataExtractor &data);
++  void GetUnsupportedForms(std::set<dw_form_t> &invalid_forms) const;
+ 
+ protected:
+   DWARFAbbreviationDeclarationCollMap m_abbrevCollMap;
+diff --git a/source/Plugins/SymbolFile/DWARF/DWARFFormValue.cpp b/source/Plugins/SymbolFile/DWARF/DWARFFormValue.cpp
+index 39c52a8..a5df9ce 100644
+--- a/source/Plugins/SymbolFile/DWARF/DWARFFormValue.cpp
++++ b/source/Plugins/SymbolFile/DWARF/DWARFFormValue.cpp
+@@ -742,3 +742,39 @@ int DWARFFormValue::Compare(const DWARFFormValue &a_value,
+   }
+   return -1;
+ }
++
++bool DWARFFormValue::FormIsSupported(dw_form_t form) {
++  switch (form) {
++    case DW_FORM_addr:
++    case DW_FORM_block2:
++    case DW_FORM_block4:
++    case DW_FORM_data2:
++    case DW_FORM_data4:
++    case DW_FORM_data8:
++    case DW_FORM_string:
++    case DW_FORM_block:
++    case DW_FORM_block1:
++    case DW_FORM_data1:
++    case DW_FORM_flag:
++    case DW_FORM_sdata:
++    case DW_FORM_strp:
++    case DW_FORM_udata:
++    case DW_FORM_ref_addr:
++    case DW_FORM_ref1:
++    case DW_FORM_ref2:
++    case DW_FORM_ref4:
++    case DW_FORM_ref8:
++    case DW_FORM_ref_udata:
++    case DW_FORM_indirect:
++    case DW_FORM_sec_offset:
++    case DW_FORM_exprloc:
++    case DW_FORM_flag_present:
++    case DW_FORM_ref_sig8:
++    case DW_FORM_GNU_str_index:
++    case DW_FORM_GNU_addr_index:
++      return true;
++    default:
++      break;
++  }
++  return false;
++}
+diff --git a/source/Plugins/SymbolFile/DWARF/DWARFFormValue.h b/source/Plugins/SymbolFile/DWARF/DWARFFormValue.h
+index 8d6af3d..2aa7460 100644
+--- a/source/Plugins/SymbolFile/DWARF/DWARFFormValue.h
++++ b/source/Plugins/SymbolFile/DWARF/DWARFFormValue.h
+@@ -86,6 +86,7 @@ public:
+                                                         bool is_dwarf64);
+   static int Compare(const DWARFFormValue &a, const DWARFFormValue &b);
+   void Clear();
++  static bool FormIsSupported(dw_form_t form);
+ 
+ protected:
+   const DWARFCompileUnit *m_cu; // Compile unit for this form
+diff --git a/source/Plugins/SymbolFile/DWARF/SymbolFileDWARF.cpp b/source/Plugins/SymbolFile/DWARF/SymbolFileDWARF.cpp
+index 5c44ee0..63c132a 100644
+--- a/source/Plugins/SymbolFile/DWARF/SymbolFileDWARF.cpp
++++ b/source/Plugins/SymbolFile/DWARF/SymbolFileDWARF.cpp
+@@ -512,6 +512,20 @@ uint32_t SymbolFileDWARF::CalculateAbilities() {
+       if (section)
+         debug_abbrev_file_size = section->GetFileSize();
+ 
++      DWARFDebugAbbrev *abbrev = DebugAbbrev();
++      if (abbrev) {
++        std::set<dw_form_t> invalid_forms;
++        abbrev->GetUnsupportedForms(invalid_forms);
++        if (!invalid_forms.empty()) {
++          StreamString error;
++          error.Printf("unsupported DW_FORM value%s:", invalid_forms.size() > 1 ? "s" : "");
++          for (auto form : invalid_forms)
++            error.Printf(" %#x", form);
++          m_obj_file->GetModule()->ReportWarning("%s", error.GetString().str().c_str());
++          return 0;
++        }
++      }
++
+       section =
+           section_list->FindSectionByType(eSectionTypeDWARFDebugLine, true)
+               .get();
+-- 
+1.8.3.1
+
